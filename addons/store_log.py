@@ -25,7 +25,7 @@ import time
 
 from mitmproxy import ctx, http
 
-DEFAULT_HOSTS = "example.com"
+DEFAULT_HOSTS = "snc-api-gw.zeekrlife.com,snc-download-cdn.zeekrlife.com"
 DEFAULT_BODY_LIMIT = 2 * 1024 * 1024  # 2 MiB
 APK_CT = "application/vnd.android.package-archive"
 

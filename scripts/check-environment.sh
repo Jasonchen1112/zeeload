@@ -12,7 +12,7 @@ else
   MITMDUMP=$(command -v mitmdump 2>/dev/null || echo mitmdump)
 fi
 PORT=${SIDELOAD_PORT:-18080}
-DOMAINS=${SIDELOAD_DOMAINS:-"store.example.com cdn.example.com"}
+DOMAINS=${SIDELOAD_DOMAINS:-"snc-api-gw.zeekrlife.com snc-download-cdn.zeekrlife.com"}
 
 # 自动探测：共享接口（bridge*）与车机（DHCP 租约按名称识别）
 detect_iface() {
@@ -49,6 +49,33 @@ detect_lease() {
   ' /var/db/dhcpd_leases
 }
 
+# DHCP 名称可能为空；只在共享接口上存在唯一匹配的 ARP 设备时自动选择。
+resolve_car_from_arp() {
+  local prefix="$1" own peers selected
+  [ -n "$prefix" ] || return 0
+  own=$(ifconfig "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+  peers=$(arp -an 2>/dev/null | awk -v iface="$IFACE" -v prefix="$prefix" -v own="$own" '
+    $3 == "at" && $5 == "on" && $6 == iface {
+      ip=$2; gsub(/[()]/, "", ip); mac=tolower($4)
+      if (index(ip, prefix) != 1 || ip == own || mac == "ff:ff:ff:ff:ff:ff") next
+      if (split(mac, oct, ":") != 6) next
+      valid=1
+      for (i=1; i<=6; i++) if (oct[i] !~ /^[0-9a-f][0-9a-f]?$/) valid=0
+      if (valid) print ip, mac
+    }
+  ' | sort -u)
+  if [ -z "$CAR_IP" ]; then
+    selected=$(printf '%s\n' "$peers" | awk -v mac="$CAR_MAC" '
+      NF == 2 && (mac == "" || $2 == tolower(mac)) { count++; ip=$1 }
+      END { if (count == 1) print ip }
+    ')
+    CAR_IP=$selected
+  fi
+  if [ -n "$CAR_IP" ] && [ -z "$CAR_MAC" ]; then
+    CAR_MAC=$(printf '%s\n' "$peers" | awk -v ip="$CAR_IP" '$1 == ip {print $2; exit}')
+  fi
+}
+
 IFACE=${SIDELOAD_IFACE:-$(detect_iface)}
 prefix=""
 if [ -n "$IFACE" ]; then
@@ -58,7 +85,7 @@ CAR_IP=${SIDELOAD_CAR_IP:-}
 CAR_MAC=${SIDELOAD_CAR_MAC:-}
 if [ -n "$prefix" ]; then
   CAR_IP=${CAR_IP:-$(detect_lease "$prefix" ip | head -1)}
-  CAR_MAC=${CAR_MAC:-$(detect_lease "$prefix" mac | head -1)}
+  resolve_car_from_arp "$prefix"
 fi
 
 say() { printf '%s\n' "$*"; }
@@ -90,13 +117,17 @@ grep -A2 dhcp_domain_name_server /etc/bootpd.plist 2>/dev/null | grep string | s
 
 say ""
 say "== 车机 =="
-if arp -n "$CAR_IP" 2>/dev/null | grep -qi "$CAR_MAC"; then
-  ok "ARP：$CAR_IP -> $CAR_MAC"
+if [ -z "$CAR_IP" ]; then
+  bad "未识别到唯一车机地址：请检查热点连接，或用 SIDELOAD_CAR_IP 指定目标 IP"
+  arp -an | awk -v iface="$IFACE" '$5 == "on" && $6 == iface' | sed 's/^/  /'
 else
-  bad "ARP 中没有 $CAR_IP -> ${CAR_MAC}（车机 IP 可能变化）"
-  arp -an | grep '192\.168\.2\.' | sed 's/^/  /'
+  if [ -n "$CAR_MAC" ] && arp -n "$CAR_IP" 2>/dev/null | grep -Fqi "$CAR_MAC"; then
+    ok "ARP：$CAR_IP -> $CAR_MAC"
+  else
+    bad "ARP 中没有 $CAR_IP -> ${CAR_MAC:-未知 MAC}（车机 IP 可能变化）"
+  fi
+  ping -c 1 -t 2 "$CAR_IP" >/dev/null 2>&1 && ok "ping $CAR_IP 通" || bad "ping $CAR_IP 失败"
 fi
-ping -c 1 -t 2 "$CAR_IP" >/dev/null 2>&1 && ok "ping $CAR_IP 通" || bad "ping $CAR_IP 失败"
 
 say ""
 say "== 目标域名解析（Mac 侧，车机使用 $IFACE 上的地址作为 DNS）=="

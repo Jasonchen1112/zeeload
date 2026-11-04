@@ -7,7 +7,7 @@
 #   2. mitmdump 以透明模式 + 内置 --emudhra 证书链解密，其余域名按 --allow-hosts 直接透传；
 #   3. 退出（Ctrl-C / 报错）时自动卸载 pf 规则并停止 mitmdump。
 #
-# 不修改 /etc/pf.conf，不替换主规则集，只操作独立 anchor：com.apple/carstore-capture
+# 不修改 /etc/pf.conf 或主规则集；临时挂接互联网共享父 anchor，退出时恢复。
 #
 # 用法：
 #   sudo bash scripts/transparent-test.sh [--all-443] [--reset-states] [--check-only]
@@ -28,9 +28,9 @@ CAR_IP=${SIDELOAD_CAR_IP:-}
 CAR_MAC=${SIDELOAD_CAR_MAC:-}
 LISTEN_IP=${SIDELOAD_LISTEN_IP:-127.0.0.1}
 PORT=${SIDELOAD_PORT:-18080}
-ANCHOR=${SIDELOAD_ANCHOR:-com.apple/carstore-capture}
-DOMAINS=${SIDELOAD_DOMAINS:-"store.example.com cdn.example.com"}
-HOSTS=${SIDELOAD_HOSTS:-example.com}
+ANCHOR=${SIDELOAD_ANCHOR:-}
+DOMAINS=${SIDELOAD_DOMAINS:-"snc-api-gw.zeekrlife.com snc-download-cdn.zeekrlife.com"}
+HOSTS=${SIDELOAD_HOSTS:-"snc-api-gw.zeekrlife.com,snc-download-cdn.zeekrlife.com"}
 
 MODE=targets
 RESET_STATES=0
@@ -144,6 +144,33 @@ detect_lease() {
   ' /var/db/dhcpd_leases
 }
 
+# DHCP 名称可能为空；只在共享接口上存在唯一匹配的 ARP 设备时自动选择。
+resolve_car_from_arp() {
+  local prefix="$1" own peers selected
+  [ -n "$prefix" ] || return 0
+  own=$(ifconfig "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+  peers=$(arp -an 2>/dev/null | awk -v iface="$IFACE" -v prefix="$prefix" -v own="$own" '
+    $3 == "at" && $5 == "on" && $6 == iface {
+      ip=$2; gsub(/[()]/, "", ip); mac=tolower($4)
+      if (index(ip, prefix) != 1 || ip == own || mac == "ff:ff:ff:ff:ff:ff") next
+      if (split(mac, oct, ":") != 6) next
+      valid=1
+      for (i=1; i<=6; i++) if (oct[i] !~ /^[0-9a-f][0-9a-f]?$/) valid=0
+      if (valid) print ip, mac
+    }
+  ' | sort -u)
+  if [ -z "$CAR_IP" ]; then
+    selected=$(printf '%s\n' "$peers" | awk -v mac="$CAR_MAC" '
+      NF == 2 && (mac == "" || $2 == tolower(mac)) { count++; ip=$1 }
+      END { if (count == 1) print ip }
+    ')
+    CAR_IP=$selected
+  fi
+  if [ -n "$CAR_IP" ] && [ -z "$CAR_MAC" ]; then
+    CAR_MAC=$(printf '%s\n' "$peers" | awk -v ip="$CAR_IP" '$1 == ip {print $2; exit}')
+  fi
+}
+
 say() { printf '%s\n' "$*"; }
 warn() { printf '警告：%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -155,6 +182,30 @@ FLOW=$OUT/flows.mitm
 CLEANED=0
 PROXY_STARTED=0
 RULES_LOADED=0
+PARENT_HOOK_ADDED=0
+PARENT_ANCHOR='com.apple.internet-sharing'
+PARENT_HOOK='rdr-anchor "carstore-capture" all'
+PARENT_MARKER=$BASE/mitm-config/carstore-parent-hook.active
+
+pf_parent_nat() {
+  pfctl -a "$PARENT_ANCHOR" -s nat 2>&1 |
+    sed '/^No ALTQ support in kernel$/d; /^ALTQ related functions disabled$/d'
+}
+
+pf_parent_rules() {
+  pfctl -a "$PARENT_ANCHOR" -s rules 2>&1 |
+    sed '/^No ALTQ support in kernel$/d; /^ALTQ related functions disabled$/d'
+}
+
+write_parent_conf() {
+  local output=$1 add_hook=$2
+  {
+    printf '%s\n' "$PARENT_RULES" | sed -n '/^scrub[- ]/p; /^no scrub /p'
+    printf '%s\n' "$PARENT_NAT" | grep -Fxv "$PARENT_HOOK"
+    [ "$add_hook" = 1 ] && printf '%s\n' "$PARENT_HOOK"
+    printf '%s\n' "$PARENT_RULES" | sed '/^scrub[- ]/d; /^no scrub /d; /^$/d'
+  } > "$output"
+}
 
 cleanup() {
   [ "$CLEANED" = 1 ] && return
@@ -164,6 +215,31 @@ cleanup() {
   say "================ 清理 ================"
 
   # 先卸载转发规则，再停代理（顺序与交接文档一致）
+  if [ "$PARENT_HOOK_ADDED" = 1 ]; then
+    if ! PARENT_NAT=$(pf_parent_nat); then
+      warn "读取父 anchor 失败；请运行 scripts/stop-transparent.sh"
+    elif printf '%s\n' "$PARENT_NAT" | grep -Fqx "$PARENT_HOOK"; then
+      if ! PARENT_RULES=$(pf_parent_rules); then
+        warn "读取父 anchor 过滤规则失败；请运行 scripts/stop-transparent.sh"
+        PARENT_RULES=""
+        PARENT_READ_FAILED=1
+      else
+        PARENT_READ_FAILED=0
+      fi
+      if [ "$PARENT_READ_FAILED" = 0 ]; then
+        write_parent_conf "$OUT/parent-restore.conf" 0
+        if pfctl -n -a "$PARENT_ANCHOR" -f "$OUT/parent-restore.conf" >/dev/null 2>&1 &&
+           pfctl -a "$PARENT_ANCHOR" -f "$OUT/parent-restore.conf" >/dev/null 2>&1; then
+          rm -f "$PARENT_MARKER"
+          say "[ok] 已移除互联网共享父 anchor 中的临时挂接"
+        else
+          warn "父 anchor 恢复失败；请运行 scripts/stop-transparent.sh"
+        fi
+      fi
+    else
+      rm -f "$PARENT_MARKER"
+    fi
+  fi
   if [ "$RULES_LOADED" = 1 ]; then
     # 卸载前记录规则计数器：Evaluations=0 说明 wildcard anchor 没被求值；Packets=0 说明没有命中
     NATV=$(pfctl -a "$ANCHOR" -s nat -v 2>&1)
@@ -177,12 +253,12 @@ cleanup() {
     EVAL=$(printf '%s\n' "$NATV" | grep -o 'Evaluations: [0-9]*' | awk '{s+=$2} END{print s+0}')
     say "pf 计数器：求值 ${EVAL} 次，命中 ${HIT} 个包（明细见 pf-after.txt）"
     if [ "${EVAL:-0}" = 0 ]; then
-      warn "anchor 规则从未被求值：主规则集的 wildcard anchor 可能未生效，需改用其他挂接方式"
+      warn "anchor 规则从未被求值：请检查父 anchor 挂接及车机流量"
     elif [ "${HIT:-0}" = 0 ]; then
       warn "anchor 被求值但没有包命中：车机 IP/目标 IP 可能变化，可试 --all-443"
     fi
     if pfctl -a "$ANCHOR" -F all 2>/dev/null; then
-      if pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep -q .; then
+      if pfctl -a "$ANCHOR" -s nat 2>/dev/null | grep -q .; then
         warn "anchor $ANCHOR 仍有规则；请手动执行：sudo pfctl -a $ANCHOR -F all"
       else
         say "[ok] 已卸载 pf 转发规则（${ANCHOR}）"
@@ -227,12 +303,11 @@ if [ -z "$IFACE" ]; then
   [ -n "$IFACE" ] || die "找不到正在共享的 bridge 接口；请确认已开启互联网共享，或用 SIDELOAD_IFACE 指定"
 fi
 PREFIX=$(iface_prefix "$IFACE")
-if [ -z "$CAR_IP" ] && [ "$CHECK_ONLY" = 0 -o "$CHECK_ONLY" = 1 ]; then
+if [ -z "$CAR_IP" ]; then
   CAR_IP=$(detect_lease "$PREFIX" ip | head -1)
 fi
-if [ -z "$CAR_MAC" ] && [ -n "$CAR_IP" ]; then
-  CAR_MAC=$(detect_lease "$PREFIX" mac | head -1)
-fi
+resolve_car_from_arp "$PREFIX"
+[ -n "$CAR_IP" ] || die "未识别到唯一车机地址；请检查热点连接，或用 SIDELOAD_CAR_IP 指定目标 IP"
 
 [ -x "$MITMDUMP" ] || die "找不到可执行的 mitmdump：${MITMDUMP}（可用 SIDELOAD_VENV 覆盖）"
 [ -f "$ADDON" ] || die "找不到 addon：$ADDON"
@@ -248,7 +323,7 @@ IFACE_ADDR=$(ifconfig "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
 say "[ok] $IFACE = $IFACE_ADDR"
 say "[ok] mitmdump: $MITMDUMP"
 
-if arp -n "$CAR_IP" 2>/dev/null | grep -qi "$CAR_MAC"; then
+if [ -n "$CAR_MAC" ] && arp -n "$CAR_IP" 2>/dev/null | grep -Fqi "$CAR_MAC"; then
   say "[ok] ARP 中 $CAR_IP 对应 $CAR_MAC"
 else
   warn "ARP 中没有 $CAR_IP -> ${CAR_MAC}。车机可能使用新 IP 或未连接；请先运行 scripts/check-environment.sh"
@@ -278,13 +353,25 @@ else
 
   # 注意：rdr-anchor 出现在 pfctl -s nat 的输出里，不在 -s rules 里
   PF_NAT=$(pfctl -s nat 2>&1) || die "无法读取 pf nat 规则：$PF_NAT"
-  if printf '%s' "$PF_NAT" | grep -q 'rdr-anchor "com.apple/\*"'; then
-    say "[ok] pf 规则集包含 rdr-anchor \"com.apple/*\"（新 anchor 会被求值）"
+  if [ -z "$ANCHOR" ] && printf '%s' "$PF_NAT" | grep -q 'rdr-anchor "com.apple/\*"'; then
+    ANCHOR='com.apple/carstore-capture'
+    say "[ok] pf 规则集包含 rdr-anchor \"com.apple/*\"（使用 ${ANCHOR}）"
+  elif [ -z "$ANCHOR" ] && printf '%s' "$PF_NAT" | grep -q 'rdr-anchor "com.apple.internet-sharing"'; then
+    ANCHOR='com.apple.internet-sharing/carstore-capture'
+    say "[ok] pf 规则集包含 rdr-anchor \"com.apple.internet-sharing\"（使用 ${ANCHOR}）"
+  elif [ -n "$ANCHOR" ]; then
+    say "[ok] 使用手动指定 pf anchor：$ANCHOR"
   else
     say "当前 nat 规则如下："
     printf '%s\n' "$PF_NAT" | sed 's/^/    /'
-    die "pf 规则集没有 rdr-anchor \"com.apple/*\"，无法在不改主规则集的前提下挂接转发规则。
-请把上面的 nat 规则发我，改用其他挂接方式。"
+    die "pf 规则集没有可用的互联网共享 rdr-anchor，无法在不改主规则集的前提下挂接转发规则。"
+  fi
+
+  if [ "$ANCHOR" = "$PARENT_ANCHOR/carstore-capture" ]; then
+    PARENT_NAT=$(pf_parent_nat) || die "无法读取互联网共享父 anchor：$PARENT_NAT"
+    if ! printf '%s\n' "$PARENT_NAT" | grep -Fqx "$PARENT_HOOK"; then
+      say "[..] 父 anchor 未挂接 carstore-capture；运行时将临时加入挂接，退出时恢复"
+    fi
   fi
 
   # pf 快照，便于事后对比或回滚参考
@@ -342,7 +429,7 @@ esac
 {
   echo "# ZEEload 透明转发规则（由 transparent-test.sh 生成，${STAMP}）"
   echo "# 仅作用于车机 ${CAR_IP}，来自接口 ${IFACE}，目标 TCP 443"
-  SRC=${CAR_IP:-${PREFIX}0/24}
+  SRC=$CAR_IP
   if [ "$MODE" = all443 ]; then
     echo "rdr pass on $IFACE inet proto tcp from $SRC to any port 443 -> $LISTEN_IP port $PORT"
   else
@@ -377,11 +464,25 @@ if ! pfctl -a "$ANCHOR" -f "$RULEFILE" 2>"$OUT/pf-load.err"; then
   die "加载 anchor 失败（见上方错误）"
 fi
 RULES_LOADED=1
-if ! pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep -q .; then
-  warn "anchor 已加载但读不到规则，请检查 pf；继续前建议先停止"
-fi
+LOADED_NAT=$(pfctl -a "$ANCHOR" -s nat 2>&1) || die "无法读取已加载的 rdr 规则：$LOADED_NAT"
+printf '%s\n' "$LOADED_NAT" | grep -q '^rdr ' || die "anchor 中未找到 rdr 规则，已停止"
 say "[ok] 已加载："
-pfctl -a "$ANCHOR" -s rules 2>/dev/null | sed 's/^/    /'
+printf '%s\n' "$LOADED_NAT" | sed 's/^/    /'
+
+if [ "$ANCHOR" = "$PARENT_ANCHOR/carstore-capture" ]; then
+  PARENT_NAT=$(pf_parent_nat) || die "无法读取互联网共享父 anchor：$PARENT_NAT"
+  if ! printf '%s\n' "$PARENT_NAT" | grep -Fqx "$PARENT_HOOK"; then
+    PARENT_RULES=$(pf_parent_rules) || die "无法读取互联网共享父 anchor 过滤规则：$PARENT_RULES"
+    write_parent_conf "$OUT/parent-with-hook.conf" 1
+    pfctl -n -a "$PARENT_ANCHOR" -f "$OUT/parent-with-hook.conf" > "$OUT/pf-parent-check.log" 2>&1 || die "父 anchor 规则预检失败，见 pf-parent-check.log"
+    PARENT_HOOK_ADDED=1
+    printf '%s\n' "$OUT" > "$PARENT_MARKER"
+    pfctl -a "$PARENT_ANCHOR" -f "$OUT/parent-with-hook.conf" > "$OUT/pf-parent-load.log" 2>&1 || die "父 anchor 挂接失败，见 pf-parent-load.log"
+    PARENT_NAT=$(pf_parent_nat) || die "父 anchor 挂接后无法读取规则：$PARENT_NAT"
+    printf '%s\n' "$PARENT_NAT" | grep -Fqx "$PARENT_HOOK" || die "父 anchor 未出现临时挂接，已停止"
+    say "[ok] 已临时挂接父 anchor，保留原有 NAT/FTP 规则"
+  fi
+fi
 
 if [ "$RESET_STATES" = 1 ]; then
   pfctl -k "$CAR_IP" 2>/dev/null && say "[ok] 已清除车机旧连接状态（会强制重连）"
