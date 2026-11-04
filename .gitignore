@@ -36,6 +36,13 @@ release/
 assets/zeeload.iconset/
 assets/alt-blue/
 
+# Android local/build files
+android/local.properties
+android/.gradle/
+android/**/build/
+android/.idea/
+android/*.iml
+
 # ---- PyInstaller（Windows 打包产物；HANDOFF.md / BUILD-REPORT.md 也放在这里，不入库）----
 windows/dist/
 windows/build/

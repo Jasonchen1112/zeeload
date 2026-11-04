@@ -51,6 +51,7 @@
 - [两个漏洞的组合](#两个漏洞的组合)
 - [快速开始（macOS）](#快速开始macos)
 - [Windows](#windows)
+- [车机端应用中心（Android）](#车机端应用中心android)
 - [结果判读](#结果判读)
 - [常见问题](#常见问题)
 - [已知限制](#已知限制)
@@ -233,6 +234,33 @@ python win_sideload.py --apk "C:\path\app.apk"
 
 详细说明、排错与限制见 [windows/README.md](windows/README.md)。
 
+## 车机端应用中心（Android）
+
+`android/` 是独立的车机端应用中心，支持 Android 9+。首次把应用中心装入车机仍使用上面的 macOS/Windows 工具；安装完成后，应用中心可以直接管理后续 APK。
+
+功能包括：
+
+- 输入 HTTP/HTTPS APK 地址，下载、解析包名/版本/签名并提交系统安装；
+- 导入车机已有的第三方应用，保存来源地址、版本、签名和安装结果；
+- 同包名、同签名且版本递增时更新并保留原应用数据；签名不一致时保留原应用并报告失败；
+- APK 缓存默认 512 MB，按最久未使用顺序清理，设置页可调整上限或一键清理；
+- 本地结构化诊断日志最多 20 MB 或 7 天；可选批量 POST 到 HTTP/HTTPS 接收地址，支持断网重试和 30 分钟实时调试；
+- 查看其他应用的权限状态，并跳转到系统应用详情页处理权限。普通应用的运行时权限仍由目标应用按系统流程申请。
+
+### 构建与安装
+
+```bash
+cd android
+cp local.properties.example local.properties
+# 修改 local.properties 中的 sdk.dir
+./gradlew :app:testDebugUnitTest :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+构建要求 Android SDK、JDK 17 和 Gradle wrapper；最低 Android 版本为 9（API 28）。发布版必须使用项目外部的稳定签名密钥，配置方式见 [android/README.md](android/README.md)。
+
+车机端设置里的 `127.0.0.1` 指车机本机；Mac 或局域网日志接收端要填写车机能够访问的 IP 或域名。日志只上传结构化事件，不上传 APK 内容或请求头；完整 APK URL 会按设置记录，URL 中若含访问参数也会被记录。
+
 ## 结果判读
 
 | 终端 / 车机现象 | 含义 | 处理 |
@@ -308,6 +336,7 @@ ZEEload/
 │   └── inspect-pf.sh             只读导出 pf 规则（排障用）
 ├── addons/store_log.py           mitmproxy 插件（注入 / 替换 / 记录）
 ├── windows/                      Windows 版（WinDivert + SNI 分流 + 图形界面）
+├── android/                      车机端应用中心（Android 9+）
 ├── assets/                       Logo 与宣传图（svg / png / icns / ico）
 ├── docs/
 │   └── 技术路径-车机APK侧载.md    原理、漏洞分析、模拟环境复现记录
