@@ -7,6 +7,7 @@ import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,8 +15,10 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
@@ -27,6 +30,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,7 +41,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,12 +56,23 @@ import java.io.File
 
 private data class Candidate(val apk: ApkInfo, val file: File, val sha256: String, val url: String)
 
+private val CarColorScheme = darkColorScheme()
+
+private val CarTypography = Typography(
+    titleLarge = TextStyle(fontSize = 28.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold),
+    titleMedium = TextStyle(fontSize = 22.sp, lineHeight = 28.sp, fontWeight = FontWeight.SemiBold),
+    bodyLarge = TextStyle(fontSize = 20.sp, lineHeight = 28.sp),
+    bodyMedium = TextStyle(fontSize = 18.sp, lineHeight = 25.sp),
+    bodySmall = TextStyle(fontSize = 16.sp, lineHeight = 22.sp),
+    labelLarge = TextStyle(fontSize = 18.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium),
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val services = (application as CarApp).services
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            MaterialTheme(colorScheme = CarColorScheme, typography = CarTypography) {
                 Surface(Modifier.fillMaxSize()) {
                     CarScreen(
                         services,
@@ -113,19 +131,27 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
         }
     }
 
-    Row(Modifier.fillMaxSize()) {
-        Column(Modifier.width(210.dp).fillMaxHeight().padding(12.dp)) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val wideScreen = maxWidth >= 1000.dp
+        val sidebarWidth = if (wideScreen) 280.dp else 240.dp
+        val pagePadding = if (wideScreen) 24.dp else 16.dp
+
+        Row(Modifier.fillMaxSize()) {
+        Column(Modifier.width(sidebarWidth).fillMaxHeight().padding(pagePadding)) {
             Text("ZEEload 应用中心", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(24.dp))
             listOf("我的应用", "导入应用", "设置").forEachIndexed { index, label ->
-                TextButton(onClick = { tab = index }, modifier = Modifier.fillMaxWidth()) {
+                TextButton(
+                    onClick = { tab = index },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                ) {
                     Text(if (tab == index) "● $label" else label)
                 }
             }
             Spacer(Modifier.weight(1f))
-            Text(status, style = MaterialTheme.typography.bodySmall)
+            Text(status, style = MaterialTheme.typography.bodyMedium)
             latestResult?.let {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(12.dp))
                 Text("最近安装：${it.packageName} · ${it.result}",
                     style = MaterialTheme.typography.bodySmall)
             }
@@ -133,17 +159,19 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
         HorizontalDivider(Modifier.width(1.dp).fillMaxHeight())
         when (tab) {
             0 -> Row(Modifier.fillMaxSize()) {
-                LazyColumn(Modifier.weight(0.42f).fillMaxHeight().padding(16.dp)) {
+                LazyColumn(Modifier.weight(0.42f).fillMaxHeight().padding(pagePadding)) {
                     item {
                         Text("已管理应用 · ${managed.size}", style = MaterialTheme.typography.titleMedium)
-                        Spacer(Modifier.height(12.dp))
-                        Button(onClick = {
+                        Spacer(Modifier.height(16.dp))
+                        Button(
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+                            onClick = {
                             selected = ""
                             address = ""
                             candidate?.let { services.cache.unpin(it.file) }
                             candidate = null
                         }) { Text("添加 APK 地址") }
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(16.dp))
                     }
                     items(managed, key = { it.packageName }) { record ->
                         TextButton(
@@ -153,7 +181,7 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                                 candidate?.let { services.cache.unpin(it.file) }
                                 candidate = null
                             },
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 76.dp)
                         ) {
                             Column(Modifier.fillMaxWidth()) {
                                 Text(record.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -170,20 +198,23 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                 HorizontalDivider(Modifier.width(1.dp).fillMaxHeight())
                 val record = managed.find { it.packageName == selected }
                 val system = installed.any { it.info.packageName == selected && it.system }
-                Column(Modifier.weight(0.58f).fillMaxHeight().padding(20.dp)) {
+                Column(Modifier.weight(0.58f).fillMaxHeight().padding(pagePadding)) {
                     Text(record?.name ?: "通过地址安装", style = MaterialTheme.typography.titleLarge)
                     if (record != null) {
-                        Text("${record.packageName} · ${record.versionName} (${record.versionCode})")
-                        Text("来源：${record.origin} · 最近结果：${record.lastResult.ifBlank { "无" }}")
+                        Text("${record.packageName} · ${record.versionName} (${record.versionCode})",
+                            style = MaterialTheme.typography.bodyLarge)
+                        Text("来源：${record.origin} · 最近结果：${record.lastResult.ifBlank { "无" }}",
+                            style = MaterialTheme.typography.bodyMedium)
                     }
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(16.dp))
                     OutlinedTextField(
                         address, { address = it }, label = { Text("APK 在线地址（HTTP/HTTPS）") },
-                        modifier = Modifier.fillMaxWidth(), singleLine = true
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 68.dp), singleLine = true
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
+                            modifier = Modifier.heightIn(min = 56.dp).widthIn(min = 150.dp),
                             enabled = !busy && !system && address.isNotBlank(),
                             onClick = {
                                 candidate?.let { services.cache.unpin(it.file) }
@@ -213,6 +244,10 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                                             services.cache.unpin(download.file)
                                             error("包名与所选应用不同：${apk.packageName}")
                                         }
+                                        if (current != null && apk.certificateSha256 != current.certificateSha256) {
+                                            services.cache.unpin(download.file)
+                                            error("签名不一致：已安装应用不会被覆盖")
+                                        }
                                         if (current != null && apk.versionCode <= current.versionCode) {
                                             services.cache.unpin(download.file)
                                             error("版本未提高：已安装 ${current.versionCode}，下载 ${apk.versionCode}")
@@ -241,10 +276,15 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                             }
                         ) { Text(if (record == null) "检查 APK" else "检查更新") }
                         if (activeDownload != null) {
-                            OutlinedButton(onClick = { activeDownload?.cancel() }) { Text("取消下载") }
+                            OutlinedButton(
+                                modifier = Modifier.heightIn(min = 56.dp),
+                                onClick = { activeDownload?.cancel() }
+                            ) { Text("取消下载") }
                         }
                         if (candidate != null) {
-                            Button(enabled = !busy, onClick = {
+                            Button(
+                                modifier = Modifier.heightIn(min = 56.dp).widthIn(min = 120.dp),
+                                enabled = !busy, onClick = {
                                 val ready = candidate ?: return@Button
                                 if (!services.installer.canInstall()) {
                                     status = "请先允许安装未知来源应用，然后返回点安装"
@@ -269,22 +309,29 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                             }) { Text("安装") }
                         }
                     }
-                    if (busy) Text("下载进度：$progress")
+                    if (busy) Text("下载进度：$progress", style = MaterialTheme.typography.bodyLarge)
                     candidate?.let {
-                        Spacer(Modifier.height(12.dp))
-                        Text("包名：${it.apk.packageName}")
-                        Text("版本：${it.apk.versionName} (${it.apk.versionCode})")
+                        Spacer(Modifier.height(16.dp))
+                        Text("包名：${it.apk.packageName}", style = MaterialTheme.typography.bodyLarge)
+                        Text("版本：${it.apk.versionName} (${it.apk.versionCode})",
+                            style = MaterialTheme.typography.bodyLarge)
                         Text("SHA-256：${it.sha256}", style = MaterialTheme.typography.bodySmall)
                         Text("签名证书：${it.apk.certificateSha256.ifBlank { "未读取" }}",
                             style = MaterialTheme.typography.bodySmall)
                     }
                     if (record != null) {
-                        Spacer(Modifier.height(20.dp))
+                        Spacer(Modifier.height(24.dp))
                         Text("权限与功能", style = MaterialTheme.typography.titleMedium)
-                        OutlinedButton(onClick = { openPermissions(record.packageName) }) {
+                        OutlinedButton(
+                            modifier = Modifier.heightIn(min = 56.dp),
+                            onClick = { openPermissions(record.packageName) }
+                        ) {
                             Text("打开系统权限设置")
                         }
-                        OutlinedButton(onClick = { permissionRefresh++ }) { Text("刷新权限状态") }
+                        OutlinedButton(
+                            modifier = Modifier.heightIn(min = 56.dp),
+                            onClick = { permissionRefresh++ }
+                        ) { Text("刷新权限状态") }
                         val permissions = remember(record.packageName, permissionRefresh) {
                             services.packages.permissions(record.packageName)
                         }
@@ -292,35 +339,41 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                             items(permissions) { permission ->
                                 Text(
                                     "${permission.name.substringAfterLast('.')} · ${permission.status}",
-                                    style = MaterialTheme.typography.bodySmall
+                                    style = MaterialTheme.typography.bodyMedium
                                 )
                             }
                         }
                     }
                 }
             }
-            1 -> Column(Modifier.fillMaxSize().padding(20.dp)) {
+            1 -> Column(Modifier.fillMaxSize().padding(pagePadding)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("导入车机原有应用", style = MaterialTheme.typography.titleLarge)
-                    TextButton(onClick = { showSystem = !showSystem }) {
+                    TextButton(
+                        modifier = Modifier.heightIn(min = 56.dp),
+                        onClick = { showSystem = !showSystem }
+                    ) {
                         Text(if (showSystem) "隐藏系统应用" else "显示系统应用")
                     }
                 }
-                Text("系统应用仅供查看；更新和权限操作由车机系统控制。")
-                Spacer(Modifier.height(12.dp))
+                Text("系统应用仅供查看；更新和权限操作由车机系统控制。",
+                    style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(16.dp))
                 LazyColumn {
                     items(installed.filter { showSystem || !it.system }, key = { it.info.packageName }) { item ->
                         if (managed.none { it.packageName == item.info.packageName }) {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(item.info.name)
+                                    Text(item.info.name, style = MaterialTheme.typography.bodyLarge)
                                     Text(
                                         "${item.info.packageName} · ${item.info.versionName}",
-                                        style = MaterialTheme.typography.bodySmall
+                                        style = MaterialTheme.typography.bodyMedium
                                     )
                                 }
                                 if (!item.system) {
-                                    OutlinedButton(onClick = {
+                                    OutlinedButton(
+                                        modifier = Modifier.heightIn(min = 56.dp),
+                                        onClick = {
                                         scope.launch(Dispatchers.IO) {
                                             services.db.apps().put(
                                                 ManagedApp(
@@ -346,34 +399,37 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                     }
                 }
             }
-            else -> Column(Modifier.fillMaxSize().padding(20.dp)) {
+            else -> Column(Modifier.fillMaxSize().padding(pagePadding)) {
                 Text("存储与诊断", style = MaterialTheme.typography.titleLarge)
-                Spacer(Modifier.height(14.dp))
-                Text("APK 缓存：${cacheSize / 1048576} MB · 待上传事件：$pendingLogs")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Spacer(Modifier.height(16.dp))
+                Text("APK 缓存：${cacheSize / 1048576} MB · 待上传事件：$pendingLogs",
+                    style = MaterialTheme.typography.bodyLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedTextField(
                         cacheLimit, { cacheLimit = it }, label = { Text("缓存上限 MB（64-2048）") },
-                        modifier = Modifier.width(240.dp), singleLine = true
+                        modifier = Modifier.widthIn(min = 240.dp, max = 320.dp).heightIn(min = 68.dp),
+                        singleLine = true
                     )
-                    Button(onClick = {
+                    Button(modifier = Modifier.heightIn(min = 56.dp), onClick = {
                         services.settings.cacheLimitMb = cacheLimit.toIntOrNull() ?: 512
                         services.cache.trim()
                         refreshStorage()
                     }) { Text("保存上限") }
-                    OutlinedButton(onClick = {
+                    OutlinedButton(modifier = Modifier.heightIn(min = 56.dp), onClick = {
                         val removed = services.cache.clear()
                         status = "已清理 ${removed / 1048576} MB"
                         refreshStorage()
                     }) { Text("清理缓存") }
                 }
-                Spacer(Modifier.height(20.dp))
+                Spacer(Modifier.height(24.dp))
                 OutlinedTextField(
                     logAddress, { logAddress = it }, label = { Text("日志接收地址（HTTP/HTTPS）") },
-                    modifier = Modifier.fillMaxWidth(), singleLine = true
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 68.dp), singleLine = true
                 )
-                Text("127.0.0.1 是车机本机。完整 URL 可能包含访问参数。")
+                Text("127.0.0.1 是车机本机。完整 URL 可能包含访问参数。",
+                    style = MaterialTheme.typography.bodyMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(onClick = {
+                    Button(modifier = Modifier.heightIn(min = 56.dp), onClick = {
                         if (logAddress.isBlank() || !(logAddress.startsWith("http://")
                                     || logAddress.startsWith("https://"))) {
                             status = "请输入有效的 HTTP/HTTPS 地址"
@@ -383,7 +439,7 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                             services.logs.scheduleOnce()
                         }
                     }) { Text("保存地址") }
-                    Text("远程推送")
+                    Text("远程推送", style = MaterialTheme.typography.bodyLarge)
                     Switch(checked = remoteEnabled, onCheckedChange = {
                         if (it && (services.settings.logUrl.isBlank())) {
                             status = "请先保存日志接收地址"
@@ -397,7 +453,7 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                             debugEnabled = false
                         }
                     })
-                    Text("实时调试 30 分钟")
+                    Text("实时调试 30 分钟", style = MaterialTheme.typography.bodyLarge)
                     Switch(checked = debugEnabled, enabled = remoteEnabled, onCheckedChange = {
                         debugEnabled = it
                         services.settings.debugUntil =
@@ -405,8 +461,9 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                         services.logs.scheduleOnce()
                     })
                 }
-                Text("最近上传：${services.settings.lastUpload}")
-                OutlinedButton(onClick = {
+                Text("最近上传：${services.settings.lastUpload}",
+                    style = MaterialTheme.typography.bodyMedium)
+                OutlinedButton(modifier = Modifier.heightIn(min = 56.dp), onClick = {
                     scope.launch(Dispatchers.IO) {
                         services.logs.clear()
                         withContext(Dispatchers.Main) {
@@ -417,5 +474,6 @@ private fun CarScreen(services: Services, openPermissions: (String) -> Unit) {
                 }) { Text("清空本地日志") }
             }
         }
+    }
     }
 }
