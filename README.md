@@ -50,8 +50,10 @@
 - [原理](#原理)
 - [两个漏洞的组合](#两个漏洞的组合)
 - [快速开始（macOS）](#快速开始macos)
+- [动态拦截（控制台：官方市场下载 → 权限跟着走）](#动态拦截控制台官方市场下载--权限跟着走)
 - [Windows](#windows)
 - [车机端应用中心（Android）](#车机端应用中心android)
+- [车机本机动态拦截 + 局域网热加载（Android 1.3.0）](#车机本机动态拦截--局域网热加载android-130)
 - [结果判读](#结果判读)
 - [常见问题](#常见问题)
 - [已知限制](#已知限制)
@@ -210,6 +212,147 @@ bash scripts/check-environment.sh
 
 可用环境变量覆盖自动探测：`SIDELOAD_IFACE`、`SIDELOAD_CAR_IP`、`SIDELOAD_CAR_MAC`、`SIDELOAD_VENV`、`SIDELOAD_DOMAINS`、`SIDELOAD_HOSTS`。
 
+## 动态拦截（控制台：官方市场下载 → 权限跟着走）
+
+### 为什么必须走官方市场
+
+车机系统给应用发权限，判据往往不是「你装了什么」，而是**「谁装的」**：
+`PackageManager` 记录的 `installerPackageName` 等于应用市场包名时，系统才按官方应用对待
+（后台保活、自启动、悬浮窗、系统级存储、通知免打扰白名单等额外授予一般都是这么发的）。
+
+所以工具的目标不是「绕过权限」，而是**让安装动作由商店自己完成**：
+
+```text
+车机商店检查更新 → 我们只改元数据（版本/哈希/大小）→ 商店自己去下载
+                → 我们只换响应体 → 商店自己调 PackageInstaller 安装
+                ⇒ installerPackageName = 商店包名，权限按官方渠道发放
+```
+
+安装会话、安装器身份、安装完成广播全部由商店发起，工具只在网络上改两处内容。
+
+### 动态拦截：运行中换包，不重启代理
+
+静态 `--inject-update/--replace-apk` 只能启动时决定一次。**动态拦截**把「注入目标」和
+「替换包」搬到运行期的控制台里，随时切换：
+
+```bash
+# 方式 A：双击（推荐）
+动态拦截.command
+
+# 方式 B：命令行
+sudo bash scripts/sideload.sh --live
+# 或
+sudo bash scripts/transparent-test.sh --all-443 --intercept-all --live --control-port 18082
+```
+
+启动后打开控制台：**http://127.0.0.1:18082/**
+
+| 控制台能做什么 | 接口 |
+|---|---|
+| 看当前武装状态（目标包 / APK / 哈希 / 剩余有效期 / 注入与替换次数） | `GET /status` |
+| 看商店里出现过的应用（包名/名称/版本/下载地址，实时学习） | `GET /apps` |
+| 武装：选注入目标 + 指定 APK，立即生效 | `POST /arm` `{"pkg":"…","apk":"/abs/path.apk","ttl":3600}` |
+| 解除武装（后续下载原样透传） | `POST /disarm` |
+| APK 换了文件后热重载（不用重启） | `POST /reload` |
+| 拦截事件流水（注入 / 替换 / 跳过 / 取签名） | `GET /events` |
+
+命令行等价用法：
+
+```bash
+curl -s -X POST http://127.0.0.1:18082/arm \
+  -H 'content-type: application/json' \
+  -d '{"pkg":"com.example.installed","apk":"/Users/you/ZkPlay.apk","ttl":3600}'
+curl -s http://127.0.0.1:18082/apps | python3 -m json.tool     # 看商店已知应用，挑外壳包
+curl -s -X POST http://127.0.0.1:18082/disarm
+```
+
+操作顺序：
+
+1. 车机连热点 → 打开应用商店 → 我的 / 检查更新 → **点开任意应用详情页**（详情页才会实时拉元数据）；
+2. 终端出现 `[inject-update]`、控制台 `/apps` 里出现该应用 → 选它 → 填 APK 绝对路径 → 武装；
+3. 车机点那个应用的「更新」；
+4. 终端出现 `[replace-apk] … 替换下载`，进度走完即装完；
+5. 按 Ctrl-C（或控制台「解除武装」）结束，pf 规则自动卸载。
+
+### 只能升级、不能重装：同包升级模式
+
+车机上的应用一旦「装过」，后续往往只允许**升级**（同包名、签名一致、版本号更高），不再允许重装或改签。
+这时工具要走的不是「换包名新装」，而是**同包升级**——注入目标就是目标 APK 自己的包名：
+
+| 约束 | 为什么 | 工具怎么处理 |
+|---|---|---|
+| **versionCode 必须比已安装的大** | 安装器只认 APK 内部的 `android:versionCode`，不认服务端元数据；同版本会报「版本未提高」 | 武装前读 APK 的 `versionCode`，与已安装版本比较，**不满足直接拒绝并说明** |
+| **签名必须与已安装的一致** | 同包升级校验签名，换签名会被安装器拒装 | 读 APK 签名证书指纹；可传 `installed_apk` 做比对并给出「一致 / 不一致」结论 |
+| **元数据版本要和 APK 一致** | 商店按元数据判断「有新版本」，安装器按 APK 判断「能否装」 | 升级模式下 `apkVersion/apkVersionName` 直接写 APK 自己的值（不再用哈希派生假版本） |
+
+武装时 `mode` 三个取值：
+
+```bash
+# auto：商店里已有该包 → 走升级；否则走换包名新装（推荐，默认）
+curl -s -X POST http://127.0.0.1:18082/arm -H 'content-type: application/json' \
+  -d '{"mode":"auto","apk":"/Users/you/ZkPlay.apk","installed_version_code":40}'
+
+# update：强制同包升级（包名取自 APK 自己）
+curl -s -X POST http://127.0.0.1:18082/arm -H 'content-type: application/json' \
+  -d '{"mode":"update","apk":"/Users/you/ZkPlay.apk","installed_apk":"/path/installed.apk"}'
+
+# new：换包名新装（外壳应用）
+curl -s -X POST http://127.0.0.1:18082/arm -H 'content-type: application/json' \
+  -d '{"mode":"new","pkg":"com.example.installed","apk":"/Users/you/app.apk"}'
+```
+
+`installed_version_code` 可显式给「车机上实际装的版本」（商店元数据可能滞后）；不给就用商店返回的
+`apkVersion`。车机上已装 42、手里的包也是 42 时，武装会被直接拒掉：
+
+```text
+升级走不通：APK 内部 versionCode=42 ≤ 已安装 42。
+安装器只认 APK 自己的 versionCode，先把版本号加大重新出包（或改包名走新装）
+```
+
+这条就是「只能升级」场景下最常见失败原因：**需要重新出包把 versionCode 加到 43 以上**，
+签名沿用原私钥；签名换了照样装不上。
+
+### 多应用市场：运行期选择拦谁
+
+车机上常不止一个商店（厂商市场 / 应用中心 / 第三方市场），域名和接口还可能随版本变。工具不写死域名：
+
+- **自动识别**：任一小 JSON 响应里出现 `apkPackageName`，就把该接口域名认成应用市场并纳入拦截范围
+  （控制台 `/markets` 会列出来，带命中次数）；
+- **逐个开关**：`POST /markets {"host":"…","enabled":false}` 立刻不再碰这个市场的流量；
+- **武装时指定**：`POST /arm {… "hosts":["api.example.com","cdn.example.net"]}` 把某个市场一起带上；
+- 全局开关：`POST /markets {"auto":false}` 关掉自动识别，只拦 `--set hosts=` 白名单里的域名。
+
+```bash
+curl -s http://127.0.0.1:18082/markets | python3 -m json.tool
+curl -s -X POST http://127.0.0.1:18082/markets -H 'content-type: application/json' \
+  -d '{"host":"api.example.com","enabled":false}'
+```
+
+协议一旦换（域名、路径、字段名一起变），能兜底的顺序是：自动识别新市场域名 → 元数据注入
+按「含 `apkPackageName` 的 JSON」匹配（不依赖具体路径）→ 下载地址认不出来时，注入后 TTL 内
+首个非 JSON 响应即当下载替换。再换不动了，就是服务端换了校验方式，得重新分析。
+
+### 验证「这次是不是官方渠道装的」
+
+```bash
+bash scripts/check-installer.sh com.example.target
+```
+
+判读只有一条：`installerPackageName` 是不是商店包名。
+
+| 结果 | 含义 |
+|---|---|
+| `installerPackageName = 商店包名` | 这次安装走的是官方渠道，系统按官方应用发放权限 |
+| `installerPackageName` 为空 / 其它 | 系统按第三方来源处理，权限不跟着走 |
+| `granted=true` 覆盖目标权限、`cmd appops get` 里悬浮窗/后台为 `allow` | 权限已到位 |
+
+### 权限为什么可能「还是没给」
+
+系统若是在**安装完成回调里按「商店以为自己在装的那个包」**发权限的，那么被发权限的是
+元数据里那个包（外壳应用），而不是你的 APK。判定办法：装完后跑上面的脚本看两个包
+——外壳包与目标包谁的权限变了。若发到了外壳包上，就改用「注入目标 = 目标 APK 自己的包名」
+（目标应用已经装着时才行），这样元数据包名与真实包名一致，权限自然落在目标包。
+
 ## Windows
 
 `windows/` 是自包含版本，用 **WinDivert** 代替 pf，用本地 **SNI 分流器**把流量喂给 mitmproxy（Windows 没有 pf，mitmproxy 透明模式不可用）。
@@ -261,6 +404,43 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 车机端设置里的 `127.0.0.1` 指车机本机；Mac 或局域网日志接收端要填写车机能够访问的 IP 或域名。日志只上传结构化事件，不上传 APK 内容或请求头；完整 APK URL 会按设置记录，URL 中若含访问参数也会被记录。
 
+## 车机本机动态拦截 + 局域网热加载（Android 1.3.0）
+
+`android/` 里的应用中心现在自带「车机本机拦截」：不需要电脑、不需要 root，
+用 per-app VPN 只接选中应用市场的流量，本地做 TLS 解密 + HTTP 改写，安装仍由商店发起。
+详见 [android/README.md](android/README.md#动态拦截车机本机120)。
+
+```bash
+cd android
+cp local.properties.example local.properties   # 改 sdk.dir
+# 把中间 CA 材料放进去（不入库）
+#   android/app/src/main/assets/ca/zeeload-int.pem
+#   android/app/src/main/assets/ca/zeeload-int.key
+./gradlew :app:testDebugUnitTest :app:assembleDebug
+```
+
+**局域网热加载（不重装 App）**：车机端可从局域网拉「规则 + 插件」模块（ECDSA 验签 + sha256 校验），
+协议变了只改 `rules.json`，逻辑变了换 `plugin.dex`，原子切换、可回滚。工具见
+[tools/module-server](tools/module-server/README.md)：
+
+```bash
+cd tools/module-server
+./gen-keys.sh                     # 一次：生成签名密钥，公钥粘进 app assets
+VERSION=1.0.2 ./build_plugin.sh   # 编插件 → dex → 签名 → out/current
+python3 serve.py --dir out/current --port 8770
+```
+
+要点与限制：只处理 IPv4、一个连接一个请求、只改写小 JSON（chunked 透传）、
+DNS 固定 223.5.5.5；商店若做证书固定则只能退回电脑端侧载。
+
+## 手机上取得报告（车机端页面）
+
+车机上的「取得报告（扫码）」页：整屏二维码 + 6 位验证码，手机扫码进浏览器页面后点「下载报告」，
+下载完成前页面会盯着进度并阻止误关；报告 = **异常 + 调试日志** 打包的 ZIP。
+端口 8888 被占用会自动顺延（8889…，最多 10 个）并在车机上提示，也能一键「换一个端口」。
+手机侧页面与预览：`python3 tools/report-portal/preview.py --port 8902`（预览服务同样会自动避让占用端口）；
+细节见 [android/README.md](android/README.md#取得报告扫码下载140)。
+
 ## 结果判读
 
 | 终端 / 车机现象 | 含义 | 处理 |
@@ -272,6 +452,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | 商店报「下载失败」 | 内容哈希与元数据对不上（替换没发生） | 检查上面的日志与机型 |
 | 安装报「包名冲突」 | 目标 APK 与已安装应用同名 | 换包名不同的 APK |
 | 装上了但桌面没图标 | 车机桌面过滤了非白名单应用 | 重启车机；从「设置 → 应用」里直接打开 |
+| 控制台 `/apps` 一直是空 | 商店没重新拉元数据（缓存） | 在车机点开应用详情页；或强行停止商店后再试 |
+| 控制台 `/arm` 返回 400 | APK 路径不对 / 不是 zip | 检查路径是否绝对路径、文件是不是真 APK |
+| 武装报「升级走不通：versionCode ≤ 已安装」 | 手里的包版本号没提上去 | 重新出包把 versionCode 加到已装版本以上，签名沿用原私钥 |
+| 武装报「签名不一致」 | 同包升级要求同一签名 | 用原签名私钥重签，或改包名走 new 模式 |
+| 装完权限还是没给 | 权限发到了「外壳包」而不是目标包 | 跑 `scripts/check-installer.sh` 对比两个包，必要时改成注入目标包自己的包名 |
 
 ## 常见问题
 
@@ -301,7 +486,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 已知限制
 
-- **只能装新包**，不能替换已安装应用；
+- **只能装新包**，不能替换已安装应用（同包名覆盖要求签名一致，本方法不解决签名）；
+- 动态模式武装带 TTL（默认 3600 秒），过期自动失效；控制台只监听 `127.0.0.1`，不对外开放；
+- 商店若在「安装完成回调」里按元数据包名发权限，权限会落在作为外壳的那款应用上，
+  需要改用「注入目标 = 目标 APK 自己的包名」；
 - **仅 IPv4 透明转发**（CDN 有 AAAA，macOS 版会用 `block return` 把目标域名的 IPv6 挡掉、逼回 IPv4；Windows 版依赖 ICS 不给客户端 IPv6）；
 - 全量解密可能让个别做了证书固定的车机应用暂时异常，退出脚本即恢复；
 - 商店「检查更新」有缓存，必须靠**详情页**触发新元数据；
@@ -325,16 +513,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```text
 ZEEload/
 ├── README.md                    本文档
-├── 一键侧载安装.command          ★ 主入口（拖入 APK）
+├── 一键侧载安装.command          ★ 主入口（拖入 APK，静态模式）
+├── 动态拦截.command               ★ 动态模式（起代理 + 打开控制台，运行中选包/换包）
 ├── 停止并恢复.command            兜底：卸载规则、停代理
 ├── 检查环境.command              只读诊断
 ├── scripts/
-│   ├── sideload.sh               侧载入口（算哈希、调引擎）
+│   ├── sideload.sh               侧载入口（算哈希、调引擎；--live 走动态模式）
+│   ├── check-installer.sh        校验安装来源（installerPackageName）与权限落地
 │   ├── transparent-test.sh       引擎：pf 转发 + mitmdump 生命周期（自动探测接口/车机）
 │   ├── stop-transparent.sh       卸载规则
 │   ├── check-environment.sh      环境自检
 │   └── inspect-pf.sh             只读导出 pf 规则（排障用）
-├── addons/store_log.py           mitmproxy 插件（注入 / 替换 / 记录）
+├── addons/store_log.py           mitmproxy 插件（注入 / 替换 / 记录 / 动态控制面）
+├── addons/apkmeta.py             APK 元信息（包名 / versionCode / 签名指纹，纯 Python）
 ├── windows/                      Windows 版（WinDivert + SNI 分流 + 图形界面）
 ├── android/                      车机端应用中心（Android 9+）
 ├── assets/                       Logo 与宣传图（svg / png / icns / ico）
@@ -348,6 +539,187 @@ ZEEload/
 ```
 
 ## 版本
+
+### v1.23.3 · 应用改名「应用助手」（2026-11-06）
+
+- 应用名抽成 `res/values/strings.xml` 的 `app_name`（桌面名称、界面标题、报告标题都读它），当前值 **应用助手**
+- 包名不变 `com.zeeload.carappcenter`，可直接覆盖升级；产物 `release/应用助手-1.23.3-release.apk`（1.23.3 / vc 29）
+
+### v1.23.2 · 应用图标 + 发布包（2026-11-06）
+
+- 新增**应用图标**：深色圆角底 + 绿色 Z + 安装落点横线（自适应图标，含 monochrome；`mipmap-*` 位图兜底）
+- 新增**正式签名与打包**：`android/keystore/zeeload-release.jks`（RSA-4096，10 年生）
+  + `keystore.properties`（不入库）+ `assembleRelease` v1/v2/v3 签名
+- 产物：`release/ZEELoad-1.23.2-release.apk`（正式签名）、`release/ZEELoad-1.23.2-debugkey.apk`（调试签名，用于覆盖旧开发包）、
+  `release/SHA256SUMS`、`release/安装说明.txt`
+
+### v1.23.2 · 修 A2/A3（2026-11-06）
+
+- **A2 市场列表手势**：整行可点选（`clickable`），`Checkbox` 只做展示（`onCheckedChange = null`），不再和列表行抢手势；
+  实测短促快滑（300ms）也能滚动整页且不会误勾选（`markets` 前后都是同样 2 个）
+- **A3 武装告警重复**：已装版本号未知时不再同时输出"升级要求签名一致"那条，只保留"还拿不到已安装版本号"（实测 warnings 只剩一条）
+
+### v1.23.1 · 修 A1：动态模块状态不恢复（2026-11-06）
+
+- 根因：`ModuleManager.activate()` 只 `return` 拼好的 Status，**没写回 `_status`**，所以界面/报告里 `enabled` 一直是 false
+  （事件里却显示"已生效"）—— 改成写回状态，`restore()` 同样写回，并在 `CarApp.onCreate` 启动时自动恢复缓存模块；
+  界面 URL 跟随 `status.baseUrl`，不再回退默认 `192.168.2.1`
+- 实测：重启后 `runtime.json` → `module.enabled=true / id=zeeload-demo / version=1.0.1 / plugin=true / url=http://127.0.0.1:8770`（Android 1.23.1）
+
+### v1.23.0 · 无 adb 也能带出现场状态（2026-11-06）
+
+- 报告新增 **`runtime.json`**：武装态（mode/target/vc/markets/warnings）、VPN 是否在拦、模块 enabled/id/version/plugin/url、
+  设置项、库内条数 —— 车机上不能 adb 时，扫一次码就能把"当时什么状态"带出来（Android 1.23.0）
+
+### v1.22.0 · 打开商店可自选（2026-11-06）
+
+- 「打开商店」改为**用户挑市场**：弹候选列表（已勾选优先），选择持久化到 `settings.storePackage`，按钮显示当前目标；
+  车机换市场包/改用别的商店 App 时不用改代码（Android 1.22.0）
+
+### v1.21.0 · 功能收敛（2026-11-06）
+
+**不再叠功能，做减法**：只保留「安装 / 调试日志 / 动态拦截」三条主线。
+
+删除：一键开始、六段进度条与分段重试、多市场轮换、`flow_runs` 落库（DB v4 迁移 DROP）、
+历史页导出/筛选/展开详情、事件导出/清空按钮、事件保留上限设置、报告里的 `exports/` 与 `flows`。
+保留：按地址安装、待安装包、安装历史（纯列表）、导入应用、字号/存储/日志接收/安装身份/诊断、
+动态拦截（市场选择 / 武装 / 启动·停止拦截 / 打开商店 / 动态模块）、扫码报告。
+
+`InterceptActivity` 917 → 619 行，`HistoryTab` 350 → 73 行，单测 76 全绿。
+
+### v1.0.25 · Research Build（2026-11-06）
+
+- 六段进度**落库**（`flow_runs`，Room v2→v3 迁移）：历史详情可重放"这次卡在哪一步"，报告 `installs.json` 带 `flows`（Android 1.20.0）
+- 历史展开自动滚动到该条；调试日志默认收起（按钮展开），详情不再被撑出屏幕
+
+### v1.0.24 · Research Build（2026-11-06）
+
+- 打开商店支持**多市场轮换**：按已勾选市场依次尝试，第一个没入口就换下一个，全失败才退「应用详情」并提示已试几个（Android 1.19.0）
+- 支持 `--es markets "pkgA,pkgB"` 预置市场，便于脚本与演示
+
+### v1.0.23 · Research Build（2026-11-06）
+
+- 进度条的失败段可**点击重试**：武装 / 拦截 / 商店（失败退到系统「应用详情」页）/ 等安装，逐步重试不再从头再来（Android 1.18.0）
+
+### v1.0.22 · Research Build（2026-11-06）
+
+- 拦截页新增**流程进度条**：`武装 → 拦截 → 商店 → 等安装 → 对账 → 收尾`，六段状态（待执行/进行中/完成/失败）+ 当前消息（Android 1.17.0）
+- 右栏改整体可滚动，事件列表改为最近 8 条（避免嵌套滚动抢手势）
+
+### v1.0.21 · Research Build（2026-11-06）
+
+- 一键开始的兜底：市场打不开时底栏黄字提示「<包名> 打不开，请手动进商店」+ warn 事件（Android 1.16.0）
+- 拦截页结果消息挪到底部固定条（车机上一眼可见，不用滚到 ③ 看）
+
+### v1.0.20 · Research Build（2026-11-06）
+
+- **一键开始**：武装 + 启动拦截（首次弹 VPN 授权）+ 打开商店合成一个按钮，按钮随「有没有 APK」自动出现（Android 1.15.0）
+
+### v1.0.19 · Research Build（2026-11-06）
+
+- 报告带上 `exports/` 目录（最近 5 个导出文件，总量 ≤2 MB）；历史页导出只留最近 10 个，并有「清理导出」（Android 1.14.0）
+- **对账命中即收尾**：装完自动解除武装 + 停止 VPN，写 `done` 事件（「对账完成：已解除武装 + 停止拦截」）
+
+### v1.0.18 · Research Build（2026-11-06）
+
+- 安装历史支持**按筛选导出**：`files/exports/install-history-<时间>.json`（含关联 `events`/`logs`）与 `.csv`（主字段 + 关联条数）（Android 1.13.0）
+
+### v1.0.17 · Research Build（2026-11-06）
+
+- 报告 `installs.json` 每条记录**内嵌关联的拦截事件与调试日志**（`events` / `logs`），看报告不用自己对时间（Android 1.12.0）
+- 拦截事件页新增 **导出**（`files/exports/*.jsonl`）与 **清空**；保留条数上限做成设置（200–20000，默认 2000）
+
+### v1.0.16 · Research Build（2026-11-06）
+
+- 拦截事件**持久化**：新增 `intercept_events` 表（Room v1→v2 迁移 + `ts` 索引），保留最近 2000 条 / 7 天（Android 1.11.0）
+- 安装历史展开详情改为「库内时间窗 + 内存」合并去重，**跨重启**仍能回答「这条是怎么来的」
+- 报告 `intercept.json` 同时取内存与库；自动武装失败现在会落一条 warn 事件（此前静默）
+
+### v1.0.15 · Research Build（2026-11-05）
+
+- 安装历史支持**点击展开**「这条是怎么来的」：同包拦截事件 + 最近 8 条调试日志（Android 1.10.0）
+- 设置页新增「动态拦截」卡：武装等待超时可改（30–1800 秒，默认 600），车机上无需 adb
+
+### v1.0.14 · Research Build（2026-11-05）
+
+- 新增**安装历史页**：按 `via=direct` / `via=market` 筛选，显示包名、vc、通道、installer 与完整结果串（Android 1.9.0）
+- 拦截武装带**超时自愈**：默认 10 分钟等不到商店安装即自动解除武装并写 warn 事件（`--ei watch_timeout_sec` 可调）
+
+### v1.0.13 · Research Build（2026-11-05）
+
+- 安装**对账**：按地址安装记 `via=direct`，拦截安装由 `MarketInstallWatch` 检测版本变化后回写
+  `via=market · installer=<市场包名>`，两条路的结果都进同一张安装历史与应用列表（Android 1.8.0）
+- 拦截页新增**带入横幅**（应用名 / 包名 / 模式 / 未勾选市场 / 待武装 / 已武装），市场候选列表改「前 5 个 + 展开」
+- 侧栏底部压缩显示最近一次安装的「哪条路 + 谁装的」
+
+### v1.0.12 · Research Build（2026-11-05）
+
+- 「待安装包」新增 **经市场安装** 一键串联：带包路径 + UPDATE 模式跳「动态拦截」，市场已勾选时自动武装（Android 1.7.0）
+- 设置页新增 **安装身份** 卡片：三条路径（地址安装 / 拦截安装 / `pm install -i`）× installer × 权限口径，附实测结论与核对命令
+
+### v1.0.11 · Research Build（2026-11-05）
+
+- 车机端把「安装者身份」做进界面：待安装包卡片显示 `安装者 = com.zeeload.carappcenter（非市场）`、
+  地址安装卡片常驻第三方口径说明、武装页提示「安装由商店发起 → installer = 商店包名」（Android 1.6.1）
+- 支持 `--es apk_url` 预填 APK 地址，便于脚本与演示
+
+### v1.0.10 · Research Build（2026-11-05）
+
+- 补一节**实测**：「伪装成应用市场」在应用层不可行（Android 15 上 `createSession` 抛
+  `SecurityException: Package <市场包名> does not belong to <uid>`），并给出复现探针、五条伪装路线为何不通、
+  两条真正可行的路径、以及装完核对 `installerPackageName` 的判据
+- `android/README.md` 增加「安装身份与权限口径」对照表：按地址安装 / 拦截链路 / 特权 `pm install -i`
+
+### v1.0.9 · Research Build（2026-11-05）
+
+- **车机字号可调（Android 1.6.0）**：`ui/CarTheme.kt` 用 `Density.fontScale` 统一放大，四档（标准 / 大·默认 / 特大 / 超大），设置里切换即时生效；基础字号与按钮高度整体上调
+- 放大后暴露的布局问题一并修掉：报告页验证码与按钮重叠、拦截页开关滚出屏幕（改固定底部操作条）、侧栏状态卡被压扁、市场列表半行截断
+
+### v1.0.8 · Research Build（2026-11-05）
+
+- **车机端 UI 统一（Android 1.5.0）**：抽出 `ui/CarUi.kt` 设计系统（色板 / Card / PrimaryButton / GhostButton / CarField / Pill / PageHeader / StatusStrip / NavItem），应用中心三个页签与动态拦截、取得报告全部改用它；主界面从 Material 默认紫改为与拦截/报告一致的深色卡片风
+- 主界面重排：侧栏（品牌 + 导航 + 工具分组 + 状态卡）、`我的应用`（列表 + 检查/安装 + 待安装包 + 权限）、`导入应用`、`设置`（存储 / 日志接收 / 诊断）全部卡片化
+- 顺手修掉截图里暴露的问题：侧栏标题换行、按钮文字折行被裁、模块 dex 可写导致 ART 拒载、报告页超出 720p
+
+### v1.0.7 · Research Build（2026-11-05）
+
+- 报告服务端口不再写死：`8888` 被占用时自动顺延（最多 10 个），二维码/地址/界面提示同步更新，另有「换一个端口」按钮
+- 预览服务 `tools/report-portal/preview.py` 同样会自动避让占用端口
+
+### v1.0.6 · Research Build（2026-11-05）
+
+- **车机端「取得报告」页（Android 1.4.0）**：二维码（纯 Kotlin QR 编码器，无 zxing）+ 6 位验证码 + 备用地址列表，手机扫码后在浏览器下载「异常 + 调试日志」ZIP；进度、断线、误关页面都有提示
+- `ReportServer`（ServerSocket 极简 HTTP）只接 GET、验证码换报告、`Content-Length` 支撑手机端进度，并把状态推回车机界面
+- `ReportBuilder` 打包 summary / exceptions / debug / installs / intercept / packages / manifest；`CrashLog` 全局未捕获异常落盘
+- Mac 端 `tools/report-portal/preview.py` 复用同一份 landing.html 做页面预览
+
+### v1.0.5 · Research Build（2026-11-05）
+
+- **局域网动态模块**：车机端从 Mac 拉取 `rules.json`（声明式改写规则）+ `plugin.dex`（注入/绕过/劫持插件），ECDSA 验签 + sha256 校验，原子切换与回滚；不重装 App 就能适配协议变化
+- 车机端控制面：`POST /markets` 之外新增动态规则/插件层（`RewriteRules` 可整体替换、字段名与下载路径可配）
+- 工具链：`tools/module-server`（`gen-keys.sh` / `build_plugin.sh`（javac + d8）/ `sign_module.py` / `serve.py`），示例插件演示注入、下载劫持、`/v3→/v2` 绕过
+- 跨工具链验证：Mac 侧 openssl 签出的模块，由打包进 APK 的公钥在真实单测里验签通过
+
+### v1.0.4 · Research Build（2026-11-05）
+
+- **车机本机动态拦截**（`android/` 1.2.0）：per-app VPN 选定应用市场 → 车机本地 TLS 解密（纯 Kotlin DER 签证书，无 BouncyCastle）→ 商店 JSON 注入 / 下载替换；安装由商店完成，权限走官方渠道
+- 车机端同样实现「升级/新装」口径：`AUTO/UPDATE/NEW`，升级前校验 versionCode 与签名
+- 车机端读 APK 用 `PackageManager` + 文件哈希，签名指纹与 `apksigner` 口径一致
+
+### v1.0.3 · Research Build（2026-11-05）
+
+- **同包升级模式**：`mode=auto|update|new`；`addons/apkmeta.py` 纯 Python 读 APK 的包名/versionCode/versionName/签名证书指纹（与 `apkanalyzer` / `apksigner` 结果一致），升级前校验版本与签名，不满足直接拒绝并给出原因
+- 升级模式下元数据的 `apkVersion/apkVersionName` 用 APK 自己的值，避免「商店说有新版、安装器说版本没提高」
+- **多应用市场动态选择**：自动识别返回应用数据的接口域名并入拦截范围；`GET/POST /markets` 逐个开关；`/arm` 可带 `hosts`
+- 下载地址字段名不认识时（`assetPath` 之类），注入后 TTL 内首个非 JSON 响应按下载兜底替换
+
+### v1.0.2 · Research Build（2026-11-05）
+
+- **动态拦截控制面**（`addons/store_log.py` + `动态拦截.command`）：运行期热武装，切换注入目标包与替换 APK、解除武装、热重载，均不需要重启 mitmdump
+- 控制台页面（`http://127.0.0.1:18082/`）实时显示商店已知应用、武装状态、注入/替换次数、事件流水；含 `GET /status` `/apps` `/events`、`POST /arm` `/disarm` `/reload`
+- 下载识别放宽：`/v2/getApk?id=…` 这类不含 `.apk` 后缀的下载地址也能被替换；下载地址字段名不认识时按「注入后的下载」兜底
+- 替换响应清理 `content-encoding` / `etag` / `digest` 等会与替换内容冲突的头
+- 新增 `scripts/check-installer.sh`：校验 `installerPackageName` 与运行期权限是否跟着官方渠道走
 
 ### v1.0.1 · Research Build（2026-10-31）
 

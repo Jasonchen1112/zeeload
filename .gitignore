@@ -49,3 +49,19 @@ windows/build/
 windows/dist-*/
 windows/build-*/
 *.spec
+
+# 模块签名私钥与构建产物（本地私有）
+tools/module-server/keys/
+tools/module-server/out/
+
+# 截图/运行产物（本机证据，不入库）
+runs/
+
+# ---- 签名材料（禁止入库） ----
+# *.jks 不整体忽略：发布签名 android/keystore/zeeload-release.jks 需要入库
+!android/keystore/*.jks
+
+# ---- 发布签名（私有仓库，刻意入库：车机只允许升级，签名丢了就无法再升级）----
+!android/keystore/
+!android/keystore/**
+!android/keystore.properties
