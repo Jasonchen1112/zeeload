@@ -1,4 +1,4 @@
-package com.zeeload.car
+package com.zeeload.carappcenter
 
 import android.content.Context
 import android.content.pm.ApplicationInfo

@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "com.zeeload.car"
+    namespace = "com.zeeload.carappcenter"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.zeeload.car"
+        applicationId = "com.zeeload.carappcenter"
         minSdk = 28
         targetSdk = 35
         versionCode = 1

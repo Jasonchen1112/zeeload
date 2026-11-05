@@ -1,4 +1,4 @@
-package com.zeeload.car
+package com.zeeload.carappcenter
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue

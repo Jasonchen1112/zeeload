@@ -1,4 +1,4 @@
-package com.zeeload.car
+package com.zeeload.carappcenter
 
 import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager

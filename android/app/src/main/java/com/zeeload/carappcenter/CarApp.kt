@@ -1,4 +1,4 @@
-package com.zeeload.car
+package com.zeeload.carappcenter
 
 import android.app.Application
 import kotlinx.coroutines.CoroutineScope
